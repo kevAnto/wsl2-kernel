@@ -1,18 +1,51 @@
-to get started run this under wsl 
+Getting Started with wsl2-kernel-main
+This repository helps you build a custom WSL2 kernel and set up a Cilium-enabled Kubernetes lab using Kind and Cilium.
 
+1. Prerequisites
+WSL2 enabled with a recent Ubuntu distribution.
+Docker Desktop for Windows, with WSL2 integration enabled.
+Task CLI installed (installation guide).
+
+2. Clone the Repository
+git clone https://github.com/kevAnto/wsl2-kernel.git
+cd wsl2-kernel-main
+
+3. Patch the Kernel Config
 chmod +x patcher.sh
 ./patcher.sh config/cilium.properties kernel/.config
+
+4. Build the Kernel (Optional)
+If you want to build a custom kernel for WSL2:
+task build:kernel
+
+5. Prepare Your Environment
+Add the export line to your ~/.bashrc for persistence.
+mkdir -p $HOME/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
+
+6. Install Kind and Cilium CLI
+
+task install:kind
+# If needed, install Cilium CLI manually:
+CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/master/stable.txt)
+curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz{,.sha256sum}
+sha256sum --check cilium-linux-amd64.tar.gz.sha256sum
+sudo tar xzvf cilium-linux-amd64.tar.gz -C /usr/local/bin
+
+7. Start a Kubernetes Cluster
+kind create cluster --config=.bin/kind-config.yaml
+
+8. Install Cilium
+task install:cilium
+
+9. Verify Setup
+kubectl get pods -A
+cilium status
+
+10. Practice Lab
+Follow the exercises in 00.md to deploy sample apps, apply Cilium policies, and use Hubble for observability.
 
 
 https://cca.purutuladhar.com
 
-task build:kernel
 task --list
-
-
-mkdir -p $HOME/.local/bin
-
-mkdir -p $HOME/.local/bin
-export PATH="$HOME/.local/bin:$PATH"
-
-task install:kind
