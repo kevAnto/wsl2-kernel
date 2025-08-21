@@ -1,0 +1,18 @@
+to get started run this under wsl 
+
+chmod +x patcher.sh
+./patcher.sh config/cilium.properties kernel/.config
+
+
+https://cca.purutuladhar.com
+
+task build:kernel
+task --list
+
+
+mkdir -p $HOME/.local/bin
+
+mkdir -p $HOME/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
+
+task install:kind

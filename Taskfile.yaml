@@ -1,0 +1,259 @@
+# https://taskfile.dev
+version: "3"
+
+vars:
+  SEMVER_MINOR: 6.6
+  SEMVER: 6.6.87.2
+
+dotenv: [.env]
+
+tasks:
+  prereq:
+    desc: Install required OS dependencies
+    vars:
+      PACKAGES:
+        - git
+        - build-essential
+        - flex
+        - bison
+        - libssl-dev
+        - libelf-dev
+        - bc
+        - dwarves
+        - python3
+        - openssl
+        - cpio
+        - qemu-utils
+    cmds:
+      - apt update -yqq
+      - apt install -yqq {{ .PACKAGES | join " " }}
+      - apt-get autoremove -y --purge
+      - apt-get clean
+
+  init:
+    desc: Initialize local kernel working directory
+    vars:
+      KERNEL_SOURCE_PATH: .src
+    cmds:
+      - mkdir -p {{.KERNEL_SOURCE_PATH}}/
+      - git -C {{.KERNEL_SOURCE_PATH}}/ init
+      - git -C {{.KERNEL_SOURCE_PATH}}/ remote add origin https://github.com/microsoft/WSL2-Linux-Kernel.git
+    status:
+      - test -d {{.KERNEL_SOURCE_PATH}}/
+      - git -C {{.KERNEL_SOURCE_PATH}}/ remote -v | grep 'WSL2-Linux-Kernel'
+
+  fetch:
+    desc: Retrieve WL2 kernel sources
+    dir: .src/
+    cmds:
+      - git config --local gc.auto 0
+      - >
+        git -c protocol.version=2 fetch
+        --no-tags
+        --prune
+        --progress
+        --no-recurse-submodules
+        --depth=1 origin
+        linux-msft-wsl-{{.SEMVER}}:refs/remotes/origin/build/linux-msft-wsl-{{.SEMVER_MINOR}}.y
+      - >
+        git checkout --progress --force
+        -B build/linux-msft-wsl-{{.SEMVER_MINOR}}.y
+        refs/remotes/origin/build/linux-msft-wsl-{{.SEMVER_MINOR}}.y
+    status:
+      - git -C .src/  branch --list | grep build/linux-msft-wsl-{{.SEMVER_MINOR}}.y
+
+  config:client-ip:
+    desc: Enable Client IP load-balancing affinity
+    cmds:
+      - >
+        ./patcher.sh config/client-ip-affinity.properties
+        .src/Microsoft/config-wsl
+    status:
+      - grep 'CONFIG_NETFILTER_XT_MATCH_RECENT=y' .src/Microsoft/config-wsl
+
+  config:cilium:
+    desc: Enable Cilium required kernel modules
+    cmds:
+      - >
+        ./patcher.sh config/cilium.properties
+        .src/Microsoft/config-wsl
+    status:
+      - grep 'CONFIG_CRYPTO_AEAD=m' .src/Microsoft/config-wsl
+      - grep 'CONFIG_XFRM_USER=m' .src/Microsoft/config-wsl
+      - grep 'CONFIG_INET_XFRM_MODE_TUNNEL=m' .src/Microsoft/config-wsl
+      - grep 'CONFIG_XFRM_OFFLOAD=y' .src/Microsoft/config-wsl
+
+  build:kernel:
+    desc: Build Kernel
+    cmds:
+      - task: init
+      - task: fetch
+      - task: config:client-ip
+      - task: config:cilium
+      - |
+        cd .src/
+        echo -ne '\n' | make -j$(nproc) KCONFIG_CONFIG=Microsoft/config-wsl
+      - rm -rf .src/.git
+      - cp -r .src .output
+    status:
+      - cmp .src/Microsoft/config-wsl .output/Microsoft/config-wsl
+
+  build:
+    desc: Build Kernel using container
+    vars:
+      IMAGE_NAME: oci.local/amd64/ubuntu:24.04-builder
+    cmds:
+      - >
+        docker image build
+        -f containers/builder/Dockerfile
+        -t {{.IMAGE_NAME}}
+        ./
+      - >
+        docker container run --rm -it
+        --name wsl2-kernel-builder
+        -v $PWD/.output/:/root/.output/
+        -v $PWD/Taskfile.yaml:/root/Taskfile.yaml
+        -v $PWD/config/:/root/config/
+        {{.IMAGE_NAME}}
+        bash -c "task build:kernel"
+      - defer: docker image rm {{.IMAGE_NAME}}
+
+  install:
+    desc: Install Kernel modules and headers
+    dir: .output/.src/
+    cmds:
+      - sudo make modules_install headers_install
+      - mkdir -p /mnt/c/Users/${WINDOWS_USERNAME}/.wsl2/kernel-{{.SEMVER}}
+      - cp arch/x86/boot/bzImage /mnt/c/Users/${WINDOWS_USERNAME}/.wsl2/kernel-{{.SEMVER}}/
+
+  post-install:
+    desc: Activate modules
+    cmds:
+      - >
+        awk '(NR>1) { print $2 }' /usr/lib/modules/$(uname -r)/modules.alias
+        | sudo tee /etc/modules-load.d/cilium.conf
+      - |
+        sudo sed \
+        -e 's@ConditionVirtualization=!container@#ConditionVirtualization=!container@' \
+        -e 's@ConditionDirectoryNotEmpty=|/lib/modules-load.d@#ConditionDirectoryNotEmpty=|/lib/modules-load.d@' \
+        -e 's@ConditionDirectoryNotEmpty=|/usr/lib/modules-load.d@#ConditionDirectoryNotEmpty=|/usr/lib/modules-load.d@' \
+        -e 's@ConditionDirectoryNotEmpty=|/usr/local/lib/modules-load.d@#ConditionDirectoryNotEmpty=|/usr/local/lib/modules-load.d@' \
+        -e 's@ConditionDirectoryNotEmpty=|/etc/modules-load.d@#ConditionDirectoryNotEmpty=|/etc/modules-load.d@' \
+        -e 's@ConditionDirectoryNotEmpty=|/run/modules-load.d@#ConditionDirectoryNotEmpty=|/run/modules-load.d@' \
+        -e 's@ConditionKernelCommandLine=|modules-load@#ConditionKernelCommandLine=|modules-load@' \
+        -e 's@ConditionKernelCommandLine=|rd.modules-load@#ConditionKernelCommandLine=|rd.modules-load@' \
+        -i /lib/systemd/system/systemd-modules-load.service
+      - sudo systemctl daemon-reload
+      - sudo systemctl restart systemd-modules-load
+      - sudo lsmod
+
+  mount:bpffs:
+    desc: Mount BPFfs
+    cmds:
+      - sudo mount bpffs /sys/fs/bpf -t bpf
+    status:
+      - findmnt -o PROPAGATION,TARGET /sys/fs/bpf | grep shared
+
+  mount:cgroup2:
+    desc: Mount Cgroup2
+    cmds:
+      - sudo mkdir -p /run/cilium/cgroupv2
+      - sudo mount -t cgroup2 none /run/cilium/cgroupv2
+      - sudo mount --make-shared /run/cilium/cgroupv2/
+    status:
+      - findmnt -o PROPAGATION,TARGET /sys/fs/cgroup | grep shared
+      - findmnt -o PROPAGATION,TARGET /run/cilium/cgroupv2 | grep shared
+
+  build:bpftool:
+    desc: compile and install bpftool
+    cmds:
+      - git clone --recurse-submodules https://github.com/libbpf/bpftool.git
+      - |
+        cd bpftool/src \
+        && sudo make install
+      - defer: rm -rf bpftool
+
+  mount:
+    desc: Fix required mount point for Cilium
+    cmds:
+      - sudo chown -R root:root /opt/cni/bin
+      - task: mount:bpffs
+      - task: mount:cgroup2
+
+  install:k3s:
+    desc: Install K3S
+    summary: >
+      Traefik as it conflicts with the LoadBalancer service controller
+    vars:
+      K3S_ARGS:
+        - --disable=traefik
+        - --disable=serviceldb
+        - --flannel-backend=none
+        - --disable-network-policy
+    cmds:
+      - task: fix:mount
+      - curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server {{ .K3S_ARGS | join " " }}' sh -s -
+      - task: kubeconfig:k3s
+
+  kubeconfig:k3s:
+    desc: Merge K3s context in user's local client configuration
+    env:
+      KUBECONFIG:
+        sh: echo "${HOME}/.kube/config:${HOME}/.kube/k3s-config"
+
+    cmds:
+      - cp ${HOME}/.kube/config ${HOME}/.kube/config.backup
+      - sudo cat /etc/rancher/k3s/k3s.yaml > ${HOME}/.kube/k3s-config
+      - kubectl config view --flatten > ${HOME}/.kube/merged-kubeconfig
+      - mv ${HOME}/.kube/merged-kubeconfig ${HOME}/.kube/config
+
+  update:
+    desc: Build and update kernel image
+    cmds:
+      - rm -rf .output/.src/
+      - task: build
+      - task: install
+      - task: post-install
+
+  install:kind:
+    desc: Install Kubernetes in Docker (KinD)
+    vars:
+      VERSION: 0.29.0
+    cmds:
+      - mkdir -p ./bin
+      - >
+        [ $(uname -m) = x86_64 ] && curl -Lo $HOME/.local/bin/kind
+        https://kind.sigs.k8s.io/dl/v{{.VERSION}}/kind-linux-amd64
+      - chmod +x $HOME/.local/bin/kind
+      - |
+        cat <<EOF | tee .bin/kind-config.yaml
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+          - role: control-plane
+          - role: worker
+          - role: worker
+        networking:
+          disableDefaultCNI: true
+        EOF
+      - kind create cluster --config=.bin/kind-config.yaml
+    generates:
+      - .bin/kind-config.yaml
+
+  install:cilium:
+    desc: install cilium
+    vars:
+      VERSION: 1.17.5
+      NETWORK_CIDR: 10.96.0.0/16
+    cmds:
+      - |
+        cat <<EOF | sudo tee /etc/sysctl.d/10-kind.conf
+        fs.inotify.max_user_watches = 524288
+        fs.inotify.max_user_instances = 512
+        EOF
+      - sudo sysctl -p
+      - >
+        cilium install
+        --version {{.VERSION}}
+        --helm-set=securityContext.privileged=true
+        --set=ipam.operator.clusterPoolIPv4PodCIDRList="{{.NETWORK_CIDR}}"
